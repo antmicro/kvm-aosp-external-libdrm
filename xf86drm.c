@@ -59,6 +59,8 @@
 #endif
 #include <math.h>
 
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+
 /* Not all systems have MAP_FAILED defined */
 #ifndef MAP_FAILED
 #define MAP_FAILED ((void *)-1)
@@ -2952,15 +2954,29 @@ sysfs_uevent_get(const char *path, const char *fmt, ...)
 }
 #endif
 
-static int drmParseSubsystemType(int maj, int min)
-{
+/* Little white lie to avoid major rework of the existing code */
+#define DRM_BUS_VIRTIO 0x10
+
 #ifdef __linux__
-    char path[PATH_MAX + 1];
+static int get_subsystem_type(const char *device_path)
+{
+    char path[PATH_MAX + 1] = "";
     char link[PATH_MAX + 1] = "";
     char *name;
+    struct {
+        const char *name;
+        int bus_type;
+    } bus_types[] = {
+        { "/pci", DRM_BUS_PCI },
+        { "/usb", DRM_BUS_USB },
+        { "/platform", DRM_BUS_PLATFORM },
+        { "/spi", DRM_BUS_PLATFORM },
+        { "/host1x", DRM_BUS_HOST1X },
+        { "/virtio", DRM_BUS_VIRTIO },
+    };
 
-    snprintf(path, PATH_MAX, "/sys/dev/char/%d:%d/device/subsystem",
-             maj, min);
+    strncpy(path, device_path, PATH_MAX);
+    strncat(path, "/subsystem", PATH_MAX);
 
     if (readlink(path, link, PATH_MAX) < 0)
         return -errno;
@@ -2969,20 +2985,34 @@ static int drmParseSubsystemType(int maj, int min)
     if (!name)
         return -EINVAL;
 
-    if (strncmp(name, "/pci", 4) == 0)
-        return DRM_BUS_PCI;
-
-    if (strncmp(name, "/usb", 4) == 0)
-        return DRM_BUS_USB;
-
-    if (strncmp(name, "/platform", 9) == 0)
-        return DRM_BUS_PLATFORM;
-
-    if (strncmp(name, "/host1x", 7) == 0)
-        return DRM_BUS_HOST1X;
+    for (unsigned i = 0; i < ARRAY_SIZE(bus_types); i++) {
+        if (strncmp(name, bus_types[i].name, strlen(bus_types[i].name)) == 0)
+            return bus_types[i].bus_type;
+    }
 
     return -EINVAL;
-#elif defined(__OpenBSD__)
+}
+#endif
+
+static int drmParseSubsystemType(int maj, int min)
+{
+#ifdef __linux__
+    char path[PATH_MAX + 1] = "";
+    char real_path[PATH_MAX + 1] = "";
+    int subsystem_type;
+
+    snprintf(path, sizeof(path), "/sys/dev/char/%d:%d/device", maj, min);
+    if (!realpath(path, real_path))
+        return -errno;
+    snprintf(path, sizeof(path), "%s", real_path);
+
+    subsystem_type = get_subsystem_type(path);
+    if (subsystem_type == DRM_BUS_VIRTIO) {
+        strncat(path, "/..", PATH_MAX);
+        subsystem_type = get_subsystem_type(path);
+    }
+    return subsystem_type;
+#elif defined(__OpenBSD__) || defined(__DragonFly__)
     return DRM_BUS_PCI;
 #else
 #warning "Missing implementation of drmParseSubsystemType"
@@ -2990,16 +3020,32 @@ static int drmParseSubsystemType(int maj, int min)
 #endif
 }
 
+static void
+get_pci_path(int maj, int min, char *pci_path)
+{
+    char path[PATH_MAX + 1], *term;
+
+    snprintf(path, sizeof(path), "/sys/dev/char/%d:%d/device", maj, min);
+    if (!realpath(path, pci_path)) {
+        strcpy(pci_path, path);
+        return;
+    }
+
+    term = strrchr(pci_path, '/');
+    if (term && strncmp(term, "/virtio", 7) == 0)
+        *term = 0;
+}
+
 static int drmParsePciBusInfo(int maj, int min, drmPciBusInfoPtr info)
 {
 #ifdef __linux__
     unsigned int domain, bus, dev, func;
-    char path[PATH_MAX + 1], *value;
+    char pci_path[PATH_MAX + 1], *value;
     int num;
 
-    snprintf(path, sizeof(path), "/sys/dev/char/%d:%d/device", maj, min);
+    get_pci_path(maj, min, pci_path);
 
-    value = sysfs_uevent_get(path, "PCI_SLOT_NAME");
+    value = sysfs_uevent_get(pci_path, "PCI_SLOT_NAME");
     if (!value)
         return -ENOENT;
 
@@ -3112,14 +3158,15 @@ static int parse_separate_sysfs_files(int maj, int min,
       "subsystem_vendor",
       "subsystem_device",
     };
-    char path[PATH_MAX + 1];
+    char path[PATH_MAX + 1], pci_path[PATH_MAX + 1];
     unsigned int data[ARRAY_SIZE(attrs)];
     FILE *fp;
     int ret;
 
+    get_pci_path(maj, min, pci_path);
+
     for (unsigned i = ignore_revision ? 1 : 0; i < ARRAY_SIZE(attrs); i++) {
-        snprintf(path, PATH_MAX, "/sys/dev/char/%d:%d/device/%s", maj, min,
-                 attrs[i]);
+        snprintf(path, PATH_MAX, "%s/%s", pci_path, attrs[i]);
         fp = fopen(path, "r");
         if (!fp)
             return -errno;
@@ -3143,11 +3190,13 @@ static int parse_separate_sysfs_files(int maj, int min,
 static int parse_config_sysfs_file(int maj, int min,
                                    drmPciDeviceInfoPtr device)
 {
-    char path[PATH_MAX + 1];
+    char path[PATH_MAX + 1], pci_path[PATH_MAX + 1];
     unsigned char config[64];
     int fd, ret;
 
-    snprintf(path, PATH_MAX, "/sys/dev/char/%d:%d/device/config", maj, min);
+    get_pci_path(maj, min, pci_path);
+
+    snprintf(path, PATH_MAX, "%s/config", pci_path);
     fd = open(path, O_RDONLY);
     if (fd < 0)
         return -errno;
@@ -3996,6 +4045,7 @@ int drmGetDevices2(uint32_t flags, drmDevicePtr devices[], int max_devices)
 
         switch (subsystem_type) {
         case DRM_BUS_PCI:
+        case DRM_BUS_VIRTIO:
             ret = drmProcessPciDevice(&device, node, node_type,
                                       maj, min, devices != NULL, flags);
             if (ret)
